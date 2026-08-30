@@ -1,0 +1,166 @@
+// Active-buzzer friendly Pest Repellent controller (COMMON-ANODE RGB)
+// - PIR on D2
+// - Active buzzers (A/B/C/D) sink-driven on pins below (or via NPN transistor collectors)
+// - RGB common-anode (LOW = ON) on D10/D11/D12
+// - Uses PRF (pulse repetition frequency) & duty to "simulate sweep" with active buzzers
+
+// ============ PIN MAP ============
+const uint8_t PIR_PIN   = 2;
+const uint8_t BUZ_A_PIN = 3; // amplified / main (if using LM386, you can ignore LM386 for active buzzer)
+const uint8_t BUZ_B_PIN = 4;
+const uint8_t BUZ_C_PIN = 5;
+const uint8_t BUZ_D_PIN = 6;
+
+const uint8_t RGB_R_PIN = 10; // COMMON-ANODE: LOW = ON
+const uint8_t RGB_G_PIN = 11;
+const uint8_t RGB_B_PIN = 12;
+
+const unsigned long REPEL_TIMEOUT = 120000UL; // 2 minutes -> repelled
+// Safety: keep bursts short and duty low
+const unsigned long BURST_ON_MS = 80;    // how long a single buzzer ON pulse lasts (ms)
+const unsigned long BURST_OFF_MS = 40;   // gap between bursts (ms)
+
+// PRF sweep params (simulated sweep)
+const float PRF_MIN = 2.0f;    // pulses per second (low)
+const float PRF_MAX = 30.0f;   // pulses per second (high)
+const float PRF_STEP = 0.5f;   // step per sweep iteration (smaller = smoother)
+const unsigned long PRF_STEP_PERIOD_MS = 800UL; // how long we hold each PRF step (ms)
+
+// state
+enum State { IDLE, ACTIVE, REPELLED };
+State state = IDLE;
+
+volatile unsigned long lastPIR = 0;
+
+// ======== utility: RGB common-anode (LOW=ON) =========
+void rgbSet(bool r, bool g, bool b) {
+  digitalWrite(RGB_R_PIN, r ? LOW : HIGH);
+  digitalWrite(RGB_G_PIN, g ? LOW : HIGH);
+  digitalWrite(RGB_B_PIN, b ? LOW : HIGH);
+}
+
+// ========== PIR ISR ==========
+void pirISR() {
+  lastPIR = millis();
+  if (state != ACTIVE) {
+    state = ACTIVE;
+    Serial.println(F("PIR: motion detected -> ACTIVE"));
+  }
+}
+
+// ========== buzzer helper: single short pulse ==========
+void buzzerPulse(uint8_t pin, unsigned long onMs) {
+  // Activate buzzer by pulling pin LOW if wired buzzer+ -> 5V and buzzer- -> pin (sink)
+  // If you wired buzzer the other way, change to digitalWrite(pin, HIGH);
+  digitalWrite(pin, LOW);   // turn buzzer ON (sink)
+  delay(onMs);
+  digitalWrite(pin, HIGH);  // OFF
+}
+
+// ========== Simulated sweep: PRF step = pulses per second ==========
+void doSimulatedSweepStep(float prf, unsigned long holdMs) {
+  // map PRF to color band
+  if (prf < (PRF_MIN + PRF_MAX) / 2.0f) {
+    // low band
+    rgbSet(false, false, true); // BLUE
+  } else {
+    // high band
+    rgbSet(false, true, false); // GREEN
+  }
+
+  // compute period between pulses (ms)
+  float periodMs = 1000.0f / prf;
+  unsigned long tStart = millis();
+  while (millis() - tStart < holdMs) {
+    // pulse each buzzer in sequence (time-multiplex) to reduce instantaneous load
+    buzzerPulse(BUZ_A_PIN, BURST_ON_MS);
+    delay(max(0L, (long)(periodMs - BURST_ON_MS)));
+    buzzerPulse(BUZ_B_PIN, BURST_ON_MS);
+    delay(max(0L, (long)(periodMs - BURST_ON_MS)));
+    buzzerPulse(BUZ_C_PIN, BURST_ON_MS);
+    delay(max(0L, (long)(periodMs - BURST_ON_MS)));
+    buzzerPulse(BUZ_D_PIN, BURST_ON_MS);
+    delay(max(0L, (long)(periodMs - BURST_ON_MS)));
+    // lightweight pause
+    delay(BURST_OFF_MS);
+  }
+}
+
+// ========== Setup ==========
+void setup() {
+  Serial.begin(115200);
+  while (!Serial) { ; }
+
+  pinMode(PIR_PIN, INPUT);
+  pinMode(BUZ_A_PIN, OUTPUT);
+  pinMode(BUZ_B_PIN, OUTPUT);
+  pinMode(BUZ_C_PIN, OUTPUT);
+  pinMode(BUZ_D_PIN, OUTPUT);
+  pinMode(RGB_R_PIN, OUTPUT);
+  pinMode(RGB_G_PIN, OUTPUT);
+  pinMode(RGB_B_PIN, OUTPUT);
+
+  // default OFF for buzzers (HIGH = OFF, assuming buzzer+ -> 5V and buzzer- -> pin)
+  digitalWrite(BUZ_A_PIN, HIGH);
+  digitalWrite(BUZ_B_PIN, HIGH);
+  digitalWrite(BUZ_C_PIN, HIGH);
+  digitalWrite(BUZ_D_PIN, HIGH);
+
+  // RGB OFF (HIGH since common-anode)
+  rgbSet(false, false, false);
+
+  attachInterrupt(digitalPinToInterrupt(PIR_PIN), pirISR, RISING);
+
+  Serial.println(F("Active-buzzer simulated-sweep system started"));
+  Serial.println(F("Note: active buzzers cannot change pitch — we simulate sweep via PRF/duty patterns."));
+}
+
+// ========== Main loop ==========
+void loop() {
+  unsigned long now = millis();
+
+  if (state == ACTIVE) {
+    // If no PIR for REPEL_TIMEOUT → REPELLED
+    if ((now - lastPIR) > REPEL_TIMEOUT) {
+      state = REPELLED;
+      Serial.println(F("State -> REPELLED (timeout)"));
+      rgbSet(true, false, true); // PURPLE (R+B)
+      // optionally silence buzzers
+      digitalWrite(BUZ_A_PIN, HIGH);
+      digitalWrite(BUZ_B_PIN, HIGH);
+      digitalWrite(BUZ_C_PIN, HIGH);
+      digitalWrite(BUZ_D_PIN, HIGH);
+      return;
+    }
+
+    // Simulate a slow sweep up and down using PRF
+    // up
+    for (float p = PRF_MIN; p <= PRF_MAX; p += PRF_STEP) {
+      Serial.print(F("ACTIVE: PRF=")); Serial.println(p);
+      doSimulatedSweepStep(p, PRF_STEP_PERIOD_MS);
+      // quick check if PIR got quiet and state changed
+      if ((millis() - lastPIR) > REPEL_TIMEOUT) break;
+    }
+    // down
+    for (float p = PRF_MAX; p >= PRF_MIN; p -= PRF_STEP) {
+      Serial.print(F("ACTIVE: PRF=")); Serial.println(p);
+      doSimulatedSweepStep(p, PRF_STEP_PERIOD_MS);
+      if ((millis() - lastPIR) > REPEL_TIMEOUT) break;
+    }
+
+  } else if (state == REPELLED) {
+    // remain until PIR asserts again
+    if ((now - lastPIR) < REPEL_TIMEOUT) {
+      state = ACTIVE;
+    }
+    // nothing else to do — purple shown
+    delay(200);
+  } else { // IDLE
+    // very low-power idle breathing / watch for PIR
+    rgbSet(false, false, false);
+    delay(200);
+    if ((millis() - lastPIR) < REPEL_TIMEOUT) {
+      state = ACTIVE;
+    }
+  }
+}
